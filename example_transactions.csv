@@ -1,0 +1,13 @@
+date,description,category,amount
+2024-01-02,Salary,income,4200.00
+2024-01-03,Rent,housing,-1500.00
+2024-01-05,Groceries,food,-120.45
+2024-01-12,Electricity,utilities,-85.10
+2024-01-19,Groceries,food,-98.30
+2024-01-25,Restaurant,food,-64.00
+2024-02-01,Salary,income,4200.00
+2024-02-02,Rent,housing,-1500.00
+2024-02-08,Groceries,food,-110.20
+2024-02-14,Internet,utilities,-60.00
+2024-02-20,Freelance invoice,income,750.00
+2024-02-27,Train pass,transport,-95.00

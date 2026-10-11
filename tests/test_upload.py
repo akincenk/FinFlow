@@ -90,3 +90,62 @@ def test_many_columns_plotted_without_error():
 
 def test_health():
     assert client.get("/health").json() == {"status": "ok"}
+
+
+TRANSACTIONS = (Path(__file__).parent.parent / "example_transactions.csv").read_bytes()
+
+
+def test_generic_csv_has_no_finance_section():
+    assert upload(EXAMPLE).json()["finance"] is None  # has Date but no amount column
+
+
+def test_transaction_ledger_analysis():
+    r = upload(TRANSACTIONS)
+    assert r.status_code == 200
+    f = r.json()["finance"]
+    assert f["transactions"] == 12
+    assert f["period"] == {"start": "2024-01-02", "end": "2024-02-27"}
+    assert f["totals"] == {"income": 9150.0, "expense": 3633.05, "net": 5516.95}
+    assert f["monthly"] == [
+        {"month": "2024-01", "income": 4200.0, "expense": 1867.85, "net": 2332.15},
+        {"month": "2024-02", "income": 4950.0, "expense": 1765.2, "net": 3184.8},
+    ]
+    assert f["top_expense_categories"] == [
+        {"category": "housing", "expense": 3000.0},
+        {"category": "food", "expense": 392.95},
+        {"category": "utilities", "expense": 145.1},
+        {"category": "transport", "expense": 95.0},
+    ]
+    assert f["running_balance"][0] == {"date": "2024-01-02", "balance": 4200.0}
+    assert f["running_balance"][-1] == {"date": "2024-02-27", "balance": 5516.95}
+    assert len(f["running_balance"]) == 12
+
+
+def test_ledger_is_sorted_and_same_day_rows_combined():
+    csv = b"Amount,DATE\n-50,2024-03-02\n100,2024-03-01\n-20,2024-03-02\n"  # unsorted, any column case
+    f = upload(csv).json()["finance"]
+    assert f["running_balance"] == [
+        {"date": "2024-03-01", "balance": 100.0},
+        {"date": "2024-03-02", "balance": 30.0},
+    ]
+    assert f["top_expense_categories"] is None  # no category column
+    assert f["totals"] == {"income": 100.0, "expense": 70.0, "net": 30.0}
+
+
+def test_missing_category_counted_as_uncategorized():
+    csv = b"date,amount,category\n2024-01-01,-10,\n2024-01-02,-30,rent\n"
+    cats = upload(csv).json()["finance"]["top_expense_categories"]
+    assert cats == [{"category": "rent", "expense": 30.0}, {"category": "uncategorized", "expense": 10.0}]
+
+
+@pytest.mark.parametrize(
+    "csv",
+    [
+        b"date,amount\n2024-01-01,10\nnot-a-date,5\n",
+        b"date,amount\n2024-01-01,10\n2024-01-02,\n",
+    ],
+)
+def test_ledger_with_invalid_rows_rejected(csv):
+    r = upload(csv)
+    assert r.status_code == 400
+    assert "1 row(s)" in r.json()["detail"]

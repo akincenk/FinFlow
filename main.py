@@ -1,7 +1,9 @@
-"""FinFlow: upload a CSV file and get descriptive statistics and histograms back.
+"""FinFlow: upload a CSV file and get statistics, histograms and, for transaction
+files, a cash-flow analysis back.
 
-Built for small financial tables (e.g. daily revenue/expense/profit), but it
-works on any CSV with numeric columns.
+Any CSV with numeric columns gets descriptive statistics. A CSV with `date` and
+`amount` columns (case-insensitive; optional `category`) is also treated as a
+transaction ledger: positive amounts are income, negative amounts are expenses.
 """
 
 import base64
@@ -16,18 +18,19 @@ from matplotlib.figure import Figure
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(1024 * 1024)))  # 1 MiB
 MAX_PLOTTED_COLUMNS = 12
+TOP_CATEGORIES = 5
 
 app = FastAPI(
     title="FinFlow",
-    description="Upload a CSV, get descriptive statistics and histograms.",
-    version="1.1",
+    description="Upload a CSV, get descriptive statistics, histograms and a cash-flow analysis.",
+    version="1.2",
 )
 
 
 @app.middleware("http")
 async def reject_large_bodies(request: Request, call_next):
     # Refuse oversized requests before the multipart body is parsed and spooled.
-    # ponytail: trusts Content-Length; chunked uploads are still caught by the read limit in /upload.
+    # This only sees Content-Length; chunked uploads are caught by the read limit in /upload.
     length = request.headers.get("content-length")
     if length and length.isdigit() and int(length) > MAX_UPLOAD_BYTES + 64 * 1024:  # allow multipart overhead
         return JSONResponse(status_code=413, content={"detail": f"File larger than {MAX_UPLOAD_BYTES} bytes"})
@@ -72,6 +75,64 @@ def summarize(df: pd.DataFrame) -> dict:
     }
 
 
+def _money(value: float) -> float:
+    return round(float(value), 2)
+
+
+def _find_column(df: pd.DataFrame, name: str) -> str | None:
+    return next((c for c in df.columns if str(c).strip().lower() == name), None)
+
+
+def analyze_transactions(df: pd.DataFrame) -> dict | None:
+    """Cash-flow analysis for ledgers with date + amount columns, else None."""
+    date_col, amount_col = _find_column(df, "date"), _find_column(df, "amount")
+    if date_col is None or amount_col is None:
+        return None
+    category_col = _find_column(df, "category")
+
+    dates = pd.to_datetime(df[date_col], errors="coerce", format="mixed")
+    amounts = pd.to_numeric(df[amount_col], errors="coerce")
+    bad = int((dates.isna() | amounts.isna()).sum())
+    if bad:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{bad} row(s) have a missing or invalid date or amount")
+
+    tx = pd.DataFrame({"date": dates, "amount": amounts}).sort_values("date", kind="stable")
+    income = tx["amount"].clip(lower=0)
+    expense = -tx["amount"].clip(upper=0)
+
+    by_month = (
+        pd.DataFrame({"month": tx["date"].dt.strftime("%Y-%m"), "income": income, "expense": expense})
+        .groupby("month", sort=True)
+        .sum()
+    )
+    monthly = [
+        {"month": m, "income": _money(r.income), "expense": _money(r.expense), "net": _money(r.income - r.expense)}
+        for m, r in by_month.iterrows()
+    ]
+
+    daily = tx.groupby(tx["date"].dt.date, sort=True)["amount"].sum().cumsum()
+    running_balance = [{"date": d.isoformat(), "balance": _money(b)} for d, b in daily.items()]
+
+    result = {
+        "transactions": len(tx),
+        "period": {"start": tx["date"].min().date().isoformat(), "end": tx["date"].max().date().isoformat()},
+        "totals": {
+            "income": _money(income.sum()),
+            "expense": _money(expense.sum()),
+            "net": _money(tx["amount"].sum()),
+        },
+        "monthly": monthly,
+        "running_balance": running_balance,
+        "top_expense_categories": None,
+    }
+    if category_col is not None:
+        categories = df.loc[tx.index, category_col].fillna("uncategorized").astype(str)
+        spent = expense.groupby(categories).sum()
+        spent = spent[spent > 0].sort_values(ascending=False, kind="stable").head(TOP_CATEGORIES)
+        result["top_expense_categories"] = [{"category": c, "expense": _money(v)} for c, v in spent.items()]
+    return result
+
+
 def histogram_png(df: pd.DataFrame) -> str:
     """Render one histogram per numeric column; return a base64 PNG."""
     numeric = df.select_dtypes(include="number").iloc[:, :MAX_PLOTTED_COLUMNS]
@@ -92,17 +153,20 @@ def histogram_png(df: pd.DataFrame) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+# Plain `def`: pandas and matplotlib are CPU-bound, so FastAPI runs this in its threadpool
+# instead of blocking the event loop.
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+def upload_file(file: UploadFile = File(...)):
     if not (file.filename or "").lower().endswith(".csv"):
         raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Only .csv files are accepted")
-    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    data = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, f"File larger than {MAX_UPLOAD_BYTES} bytes")
     if not data.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "File is empty")
     df = parse_csv(data)
-    return {"summary": summarize(df), "plot_base64": histogram_png(df)}
+    summary = summarize(df)
+    return {"summary": summary, "finance": analyze_transactions(df), "plot_base64": histogram_png(df)}
 
 
 @app.get("/health")
